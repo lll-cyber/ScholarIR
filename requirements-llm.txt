@@ -1,0 +1,5 @@
+# Optional: in-process local Qwen2.5-GPTQ for Understanding
+torch
+transformers>=4.43.0
+accelerate
+auto-gptq
