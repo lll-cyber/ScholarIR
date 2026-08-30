@@ -4,6 +4,7 @@
 
 | 文档 | 主题 |
 |------|------|
+| [2026-08-30-Filter与Ranking流程.md](./2026-08-30-Filter与Ranking流程.md) | 当前 Filter（规则+关键词+LLM+RefChain）与 Ranking（多特征融合）流程 |
 | [2026-08-21-Understanding到API的adapt对照.md](./2026-08-21-Understanding到API的adapt对照.md) | 基线如何把理解结果变成 API 调用；有无一源一 adapt |
 | [2026-08-21-学术API形式调研.md](./2026-08-21-学术API形式调研.md) | S2/OpenAlex/PubMed/arXiv/Serper 形式、参数、与 slots 适配 |
 | [2026-08-20-记忆模糊查询调研.md](./2026-08-20-记忆模糊查询调研.md) | 公开集几乎无「记不清标题」；specific 少量；导航层 P2 |
