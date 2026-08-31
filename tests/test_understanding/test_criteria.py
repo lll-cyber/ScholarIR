@@ -61,21 +61,30 @@ def test_criteria_includes_both_method_terms() -> None:
     assert texts == {"target networks", "Deep Q-learning"}
 
 
-def test_filter_enforces_required_method() -> None:
+def test_filter_required_method_is_soft_not_hard_zero() -> None:
+    """required method criteria feed the LLM judge; keyword path does not hard-zero.
+
+    Design choice: brittle token matching on method phrases kills recall
+    (synonyms / paraphrases). Hard year/negation rules stay; method/topic
+    requirements are soft via relevance_criteria → LLM prompt.
+    """
+    criteria = slots_to_criteria(
+        "survey",
+        {
+            "terms": [
+                empty_term("autoregressive transformer", "method"),
+                empty_term("video generation", "topic"),
+            ]
+        },
+        "autoregressive transformer video generation",
+    )
+    assert any(c.get("type") == "method" and c.get("required") for c in criteria)
+
     understanding = UnderstandingResult(
         raw_question="autoregressive transformer video generation",
         intent="survey",
         slots={"topic": "video generation"},
-        relevance_criteria=slots_to_criteria(
-            "survey",
-            {
-                "terms": [
-                    empty_term("autoregressive transformer", "method"),
-                    empty_term("video generation", "topic"),
-                ]
-            },
-            "autoregressive transformer video generation",
-        ),
+        relevance_criteria=criteria,
     )
     diffusion = PaperRef(
         paper_id="p1",
@@ -88,10 +97,13 @@ def test_filter_enforces_required_method() -> None:
         abstract="We use autoregressive transformers to generate videos.",
     )
     score_bad, reason_bad = _score_paper(diffusion, understanding, {})
-    score_good, _ = _score_paper(ar, understanding, {})
-    assert score_bad == 0.0
-    assert reason_bad == "method_missing"
-    assert score_good > 0.0
+    score_good, reason_good = _score_paper(ar, understanding, {})
+    # No method_missing hard kill
+    assert reason_bad != "method_missing"
+    assert score_bad > 0.0
+    # Matching paper still ranks higher on keyword coverage
+    assert score_good > score_bad
+    assert "keyword_coverage" in reason_good
 
 
 def test_specific_gap_skips_raw() -> None:
@@ -137,7 +149,7 @@ def test_finalize_prefers_conceptual_over_raw() -> None:
 if __name__ == "__main__":
     test_criteria_from_required_terms_not_intent()
     test_criteria_includes_both_method_terms()
-    test_filter_enforces_required_method()
+    test_filter_required_method_is_soft_not_hard_zero()
     test_specific_gap_skips_raw()
     test_finalize_prefers_conceptual_over_raw()
     print("criteria tests passed")

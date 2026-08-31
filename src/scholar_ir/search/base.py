@@ -1,6 +1,6 @@
 """Search (stage-2): Understanding → candidates via per-source adapt.
 
-与 filter 一起构成「自主搜索策略」阶段（迭代式检索后续补齐）。
+与 filter 一起构成「自主搜索」阶段；broaden/narrow 迭代见 ``iterate.py``。
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from scholar_ir.search.adapt.semantic import (
     adapt_semantic,
     search_semantic_detail,
 )
+from scholar_ir.search.dedup import canonical_paper_id
 from scholar_ir.types import PaperRef, RetrievalResult, SubQuery, UnderstandingResult
 
 
@@ -132,6 +133,71 @@ def _run_source(
     return entry
 
 
+# ---------- Semantic-source budget allocation ----------
+
+# Higher = more important.  Sub_queries are sorted by this before the budget
+# cap is applied, so semantic (S2) always sees the highest-value queries.
+_PRIORITY_BY_ANGLE: Dict[str, int] = {
+    "core": 100,
+    "synonym": 80,
+    "abbrev": 70,
+    "entity": 60,
+    "conceptual": 50,
+    "metadata": 30,
+    "raw": 10,
+}
+_PRIORITY_BY_MODE = {"semantic": 1000, "decomposition": 50}
+
+
+def _subquery_priority(sq: SubQuery) -> int:
+    """Composite priority score for the sub-query."""
+    base = _PRIORITY_BY_ANGLE.get(getattr(sq, "angle", ""), 40)
+    mode_bonus = _PRIORITY_BY_MODE.get(getattr(sq, "mode", ""), 0)
+    channel_bonus = 0
+    if getattr(sq, "channel", "") == "semantic":
+        channel_bonus = 1000
+    return base + mode_bonus + channel_bonus
+
+
+def _select_semantic_budget(
+    sub_queries: List[SubQuery],
+    semantic_max_queries: int,
+) -> set:
+    """Pick the set of sub_query qids eligible for semantic (S2) source.
+
+    Allocation is by priority, not by position.  semantic-channel subqueries
+    are always eligible; the remaining budget is filled by the top-scored
+    sub_queries (angle core > synonym > abbrev > ... > raw).
+
+    Returns:
+        set of qid strings eligible for S2 calls.
+    """
+    if semantic_max_queries <= 0 or not sub_queries:
+        return set()
+
+    # Always-eligible: anything explicitly semantic-channeled or semantic-mode.
+    always: List[SubQuery] = [
+        sq for sq in sub_queries
+        if getattr(sq, "channel", "") == "semantic"
+        or getattr(sq, "mode", "") == "semantic"
+    ]
+
+    # Remaining, sorted by priority descending, stable.
+    remaining: List[SubQuery] = [sq for sq in sub_queries if sq not in always]
+    remaining.sort(key=_subquery_priority, reverse=True)
+
+    eligible: List[SubQuery] = list(always)
+    for sq in remaining:
+        if len(eligible) >= semantic_max_queries:
+            break
+        eligible.append(sq)
+
+    return {
+        getattr(sq, "qid", "") or f"i{i}"
+        for i, sq in enumerate(eligible)
+    }
+
+
 def retrieve(
     understanding: UnderstandingResult,
     options: Dict[str, Any] | None = None,
@@ -147,20 +213,34 @@ def retrieve(
     slots = understanding.slots or {}
     sub_queries: List[SubQuery] = understanding.sub_queries or []
 
+    # Pre-compute semantic budget allocation by priority (not position).
+    # Mode/semantic-channel sub_queries always pass; remaining are picked
+    # in priority order (core > synonym > abbrev > entity > ...).
+    semantic_eligible = _select_semantic_budget(sub_queries, semantic_max_queries)
+
     candidates: List[PaperRef] = []
+    # `seen` uses canonical keys so the same paper from arxiv/openalex/s2
+    # only enters the candidate list once.
     seen = set()
     trace: List[Dict[str, Any]] = []
     n_api_calls = 0
 
     for i, sq in enumerate(sub_queries):
+        sqid = getattr(sq, "qid", None) or f"i{i}"
+        sq_semantic_eligible = sqid in semantic_eligible
         for source in sources:
-            # Limit S2 calls to the top-K most important sub-queries
-            if source == "semantic" and i >= max(0, semantic_max_queries):
+            # Limit S2 calls to the priority-selected sub-queries
+            if source == "semantic" and not sq_semantic_eligible:
                 trace.append({
-                    "qid": sq.qid,
+                    "qid": sqid,
                     "source": source,
                     "status": "skipped",
-                    "note": f"semantic budget exhausted (semantic_max_queries={semantic_max_queries})",
+                    "note": (
+                        f"semantic budget exhausted (semantic_max_queries="
+                        f"{semantic_max_queries}); priority rank outside budget"
+                    ),
+                    "priority": _subquery_priority(sq),
+                    "angle": getattr(sq, "angle", ""),
                     "hits": [],
                 })
                 continue
@@ -171,10 +251,11 @@ def retrieve(
             if not dry_run and entry.get("status") not in ("skipped", "dry_run"):
                 n_api_calls += 1
             for p in papers:
-                key = p.paper_id or p.title
-                if key and key not in seen:
-                    seen.add(key)
-                    candidates.append(p)
+                ckey = canonical_paper_id(p, index=len(candidates))
+                if not ckey or ckey in seen:
+                    continue
+                seen.add(ckey)
+                candidates.append(p)
             trace.append(entry)
 
     return RetrievalResult(

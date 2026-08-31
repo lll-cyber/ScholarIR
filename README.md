@@ -7,9 +7,9 @@
 | # | 包名 | 对应能力 | 状态 |
 |---|------|----------|------|
 | (1) | `query_understanding/` | 查询理解与分解（意图、实体、子查询、改写扩展） | **已实现** |
-| (2) | `search/` + `filter/` | 自主搜索 + 过滤不相干/低质量；迭代策略后续补 | 搜索已实现；过滤为 stub |
-| (3) | `ranking/` | 论文综合排序（细粒度相关性） | **骨架 stub** |
-| (4) | `organize/` | 搜索结果归纳整理（列表/关系图等） | **骨架 stub** |
+| (2) | `search/` + `filter/` | 自主搜索（含 broaden/narrow）+ 过滤/LLM 精判/impact 融合 | **已实现** |
+| (3) | `ranking/` | 按 Filter 分数排序 + threshold / arxiv_only / max_return 截断 | **已实现**（薄层） |
+| (4) | `organize/` | 分档列表 + 引用关系图 + 自然语言入选理由 | **已实现** |
 
 编排：`scholar_ir.run(question)` → `pipeline.py`
 
@@ -29,11 +29,11 @@ ScholarIR/
 │   ├── config.py
 │   ├── pipeline.py              # 四阶段编排
 │   ├── query_understanding/     # (1) 查询理解与分解
-│   ├── search/                  # (2) 自主搜索（多源 adapt）
+│   ├── search/                  # (2) 自主搜索（多源 adapt + 迭代）
 │   │   └── adapt/               # arxiv / openalex / semantic
-│   ├── filter/                  # (2) 候选过滤（原 judge，stub）
-│   ├── ranking/                 # (3) 综合排序（stub）
-│   ├── organize/                # (4) 结果归纳整理（stub）
+│   ├── filter/                  # (2) 候选过滤（关键词 + LLM + impact）
+│   ├── ranking/                 # (3) 排序截断（分数由 filter 产出）
+│   ├── organize/                # (4) 列表 / 关系图 / 入选理由
 │   ├── eval/                    # 集合 P/R/F1
 │   ├── llm/
 │   └── vendor_spar/
@@ -43,19 +43,19 @@ ScholarIR/
 ## 快速开始
 
 ```bash
-cd /data3/ai_inn/ScholarIR
-export PYTHONPATH=/data3/ai_inn/ScholarIR/src:$PYTHONPATH
+cd /data/coding/ScholarIR
+export PYTHONPATH=/data/coding/ScholarIR/src:$PYTHONPATH
 
 # (1) 查询理解
 python3 scripts/demo_understanding.py --deepseek
 
 # (2) 搜索 adapt
 python3 scripts/demo_retrieval_arxiv.py --live
-python3 scripts/test_s2_api.py              # Semantic Scholar (S2_API_KEY, 1 req/s)
+python3 scripts/test_s2_api.py              # Semantic Scholar (S2_API_KEY)
 python3 scripts/demo_retrieval_semantic.py --live
 
-# 全链路 smoke
-python3 scripts/smoke_pipeline.py
+# 全链路 smoke（落盘中间结果）
+python3 scripts/smoke_pipeline.py --deepseek --out-dir outputs/smoke_run
 
 # PaSa 集合 F1
 python3 scripts/eval_pasa.py --split auto --limit 5 --deepseek
@@ -73,7 +73,10 @@ python3 scripts/eval_pasa.py --split auto --limit 5 --deepseek
 
 ## 当前状态
 
-- (1) Understanding：slots + terms + Slot Usage；DeepSeek 可选
-- (2) Search：默认 **arxiv + openalex + semantic (S2)** 三源 union；S2 全局限速 `S2_RATE_LIMIT_RPS=1`
-- (2) Filter：stub pass-all（原 Judge）
-- (3)(4)：透传骨架，待实现
+- (1) Understanding：slots + terms + Slot Usage；DeepSeek 可选；`add_survey_modifier` 默认关
+- (2) Search：默认 **arxiv + openalex + semantic** 三源（`DEFAULT_SOURCES`）
+- (2) Filter：硬规则（年/否定）+ 关键词 + 可选 LLM；`relevance_criteria` 进 LLM 软判定（非硬淘汰）；impact 融合（引用/时效/venue/标题密度，**不是**向量 embedding）+ 跨 intent 归一化
+- (3) Ranking：不再重算分 / 不做 embedding；只做排序与截断（模块名仍叫 ranking；职责≈select/truncate）。`arxiv_only` 默认 False，评测/smoke 请显式 True
+- (4) Organize：高度/部分相关分档、`selection_reason`、引用图（OpenAlex / Crossref / S2 回退）
+- 日志：`run(..., {"log_file": "logs/run.log"})` 或环境变量 `SCHOLAR_IR_LOG_FILE`；JSON 落盘仍用 `scripts/smoke_pipeline.py --out-dir`
+- `embeddings.py`：独立向量客户端，**尚未接入** filter/ranking（与 impact 特征不同）

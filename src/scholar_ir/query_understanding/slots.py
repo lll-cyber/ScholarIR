@@ -3,6 +3,7 @@
 Round1 (tightened): filters + term_groups + claim + coverage_gap + query_skeleton.
 Internal slots keep terms[] (mapped from term_groups) for Slot Usage / criteria.
 query_skeleton = core_text (relation-preserving) + replaceable parts (spans).
+dataset / domain = optional application context (filled by LLM Round1).
 Lexical expand = render core_text, swap at most ONE replaceable span.
 """
 
@@ -25,6 +26,8 @@ TERM_ROLES = ("topic", "method", "entity", "other")
 LIGHT_SLOT_KEYS = (
     "topic",
     "method",
+    "dataset",
+    "domain",
     "year_from",
     "year_to",
     "venue",
@@ -303,7 +306,14 @@ def _apply_true_filters(slots: Dict[str, Any], filters: Any) -> Dict[str, Any]:
 
 
 def _sync_compat_topic_method(slots: Dict[str, Any]) -> Dict[str, Any]:
-    """Derive legacy topic/method from term_groups/terms for downstream compat."""
+    """Derive legacy topic/method from term_groups/terms ONLY when missing.
+
+    Priority: top-level slots.topic/method (set explicitly by Round1 LLM or legacy path)
+    > term_groups role-tagged terms > first required term as topic fallback.
+
+    Top-level values win so the LLM's explicit subject/approach statement takes
+    precedence over imperfect role tagging.
+    """
     slots = dict(slots)
     terms = list(slots.get("terms") or [])
     if not (slots.get("method") or "").strip():
@@ -348,6 +358,13 @@ def normalize_round1_output(data: Dict[str, Any]) -> Dict[str, Any]:
         slots["claim"] = None
     else:
         slots["claim"] = str(claim).strip() or None
+
+    for key in ("topic", "method", "dataset", "domain"):
+        val = data.get(key)
+        if val is None or val == "" or val == "null":
+            slots[key] = None
+        else:
+            slots[key] = str(val).strip() or None
 
     term_groups = normalize_term_groups(data.get("term_groups"))
     slots["term_groups"] = term_groups

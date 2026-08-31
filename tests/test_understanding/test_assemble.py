@@ -43,18 +43,33 @@ def test_assemble_lexical_from_skeleton() -> None:
         }
     )
     plan = apply_slot_usage("survey", slots, max_n=5)
+    # 默认 add_survey_modifier=False：不往 core 塞 survey 词（避免检索漂移）
     subs = assemble_from_tasks(
         "survey on RAG since 2020",
         "survey",
         slots,
         plan,
         max_n=5,
+        add_survey_modifier=False,
     )
     assert len(subs) >= 1
     assert subs[0].filters.get("year_from") == 2020
     assert all(sq.mode == "lexical" for sq in subs)
     core = next(sq for sq in subs if sq.angle == "core")
-    assert "survey" in (core.modifiers or []) or "survey" in core.text.lower()
+    assert "survey" not in (core.modifiers or [])
+
+    # 显式打开时，core 应带 survey modifier / 文本
+    plan2 = apply_slot_usage("survey", slots, max_n=5, add_survey_modifier=True)
+    subs2 = assemble_from_tasks(
+        "survey on RAG since 2020",
+        "survey",
+        slots,
+        plan2,
+        max_n=5,
+        add_survey_modifier=True,
+    )
+    core2 = next(sq for sq in subs2 if sq.angle == "core")
+    assert "survey" in (core2.modifiers or []) or "survey" in core2.text.lower()
 
 
 def test_no_query_drift_multi_part() -> None:

@@ -175,7 +175,69 @@ def extract_slots_heuristic(question: str) -> Tuple[str, Dict[str, Any]]:
         if method.lower() not in topic.lower():
             terms.append(empty_term(method, "method"))
     slots["terms"] = terms or None
+
+    # Heuristic coverage_gap detection (signal 1): short / vague topic
+    # — a 1-2 word topic is too generic to reliably match paper titles.
+    if topic:
+        n_words = len([w for w in topic.split() if w])
+        if n_words <= 2:
+            slots["coverage_gap_likely"] = True
+            slots["claim"] = slots.get("claim") or _detect_heuristic_claim(question)
+            # also tag the topic term as gap
+            if terms:
+                terms[0] = {**terms[0], "coverage_gap_likely": True}
+
+    # Heuristic coverage_gap detection (signal 2): claim-like patterns in
+    # the question even when topic is longer (e.g. "X is better than Y for Z").
+    claim_text = _detect_heuristic_claim(question)
+    if claim_text and not slots.get("claim"):
+        slots["claim"] = claim_text
+        slots["coverage_gap_likely"] = True
+
     return intent, ensure_topic_term(slots)
+
+
+_CLAIM_PATTERNS = [
+    # comparison: X better/worse/outperform than Y
+    r"\b(better|worse|outperform|exceed|superior|inferior|comparative|compares?\s+to|compared\s+to)\b",
+    # which...better/worse (question form) — comma and trailing content OK
+    r"\bwhich\s+(?:is|are|method|model|approach)?\s*(?:better|worse|faster|more\s+effective)",
+    # what causes / what leads to / what results in
+    r"\bwhat\s+(?:cause|causes|caused|lead|leads|leads?\s+to|result|results?\s+in)\b",
+    # causality: X affect/cause/lead to/result in Y
+    r"\b(cause|causes|caused|lead|leads|leading|results?\s+in|resulted?\s+in)\b",
+    r"\b(affect|affects|affected|impact|impacts|influences?|influence)\b",
+    # how does X affect/influence Y
+    r"\bhow\s+does\s+\w+\s+(affect|influence|impact|improve|help|enable|boost)\b",
+    # modal claims: does X help/improve/enable Y
+    r"\b(does|do|can|should|will|would)\s+\w+\s+(help|improve|increase|decrease|reduce|enable|support)\b",
+    # prove/show/demonstrate
+    r"\b(prove|show|demonstrate|indicate|suggest)\s+(that|whether)\b",
+    # performance improvement
+    r"\b(improve|improves|improving|enhance|enhances|enhancing|boost|boosts|boosting)\b",
+    # role/impact of X
+    r"\b(impact|effect|influence|role)\s+of\b",
+    # effectiveness
+    r"\b(is|are)\s+(it|this|these)\s+(true|effective|useful|helpful|good|bad|valid)\b",
+]
+
+
+def _detect_heuristic_claim(question: str) -> Optional[str]:
+    """Lightweight claim-like pattern detector for heuristic mode.
+
+    Returns the matched phrase (trimmed) when a comparison/causality/proposition
+    pattern is detected, else None. Does not run when LLM is used.
+    """
+    if not question:
+        return None
+    q = question.strip()
+    for pat in _CLAIM_PATTERNS:
+        m = re.search(pat, q, re.I)
+        if m:
+            start, end = m.span()
+            text = q[max(0, start - 30):min(len(q), end + 30)]
+            return re.sub(r"\s+", " ", text).strip(" ,.;:")
+    return None
 
 
 def rewrite_by_intent(

@@ -17,7 +17,12 @@ from scholar_ir.query_understanding.assemble import assemble_from_tasks
 from scholar_ir.query_understanding.flow_log import format_understanding_flow
 from scholar_ir.query_understanding.llm_extract import try_llm_extract
 from scholar_ir.query_understanding.rules import extract_slots_heuristic
-from scholar_ir.query_understanding.slot_usage import ExpansionTask, apply_slot_usage, finalize_task_budget
+from scholar_ir.query_understanding.slot_usage import (
+    ExpansionTask,
+    apply_slot_usage,
+    should_auto_decompose,
+    finalize_task_budget,
+)
 from scholar_ir.query_understanding.slots import empty_slots, ensure_topic_term, slots_to_criteria
 from scholar_ir.query_understanding.variant_quality import resolve_coverage_gap_likely
 
@@ -41,7 +46,13 @@ def understand(question: str, options: Dict[str, Any] | None = None) -> Understa
     max_lexical_swaps = int(options.get("max_lexical_swaps", 3))
     use_llm = bool(options.get("use_llm", True))
     recall_mode = bool(options.get("recall_mode", True))
-    enable_decomposition = bool(options.get("enable_decomposition", False))
+    # Decomposition auto-enables for queries that need it; explicit option wins.
+    decompose_explicit = options.get("enable_decomposition")
+    enable_decomposition = (
+        bool(decompose_explicit)
+        if decompose_explicit is not None
+        else False  # filled in below after slots are ready
+    )
     enable_semantic = bool(options.get("enable_semantic", True))
     max_semantic = int(options.get("max_semantic", 2))
     use_llm_expand = bool(options.get("use_llm_expand", False))
@@ -111,6 +122,12 @@ def understand(question: str, options: Dict[str, Any] | None = None) -> Understa
     if use_llm and enable_semantic and not use_llm_expand and gap:
         semantic_reserve = min(max_semantic, max(1, max_n // 2))
 
+    # Auto-enable decomposition when query signals indicate it (term has gap
+    # + instances, or skeleton has multi-aspect required parts). Only applies
+    # when caller did not explicitly set enable_decomposition.
+    if decompose_explicit is None:
+        enable_decomposition = should_auto_decompose(slots, intent=intent)
+
     # --- Slot usage / lexical tasks ---
     plan = apply_slot_usage(
         intent,
@@ -152,6 +169,8 @@ def understand(question: str, options: Dict[str, Any] | None = None) -> Understa
             "api_filters": dict(plan.api_filters),
             "n_tasks": len(plan.tasks),
             "tasks": [_task_snap(t) for t in plan.tasks],
+            "enable_decomposition": enable_decomposition,
+            "auto_decompose": decompose_explicit is None,
             "skeleton": {
                 "core_text": (sk2 or {}).get("core_text"),
                 "parts": (sk2 or {}).get("parts"),

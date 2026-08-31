@@ -63,28 +63,56 @@ def apply_slot_usage(
     semantic_reserve: int = 0,
     add_survey_modifier: bool = False,
 ) -> RetrievalPlan:
-    """Project slots → api_filters + ExpansionTask list (budgeted, not padded)."""
+    """Project slots → api_filters + ExpansionTask list (budgeted, not padded).
+
+    Channel semantics (aligned with filter/base.py):
+      - api_filter: pushed to search API (year/venue/authors). Search stage
+        applies these as hard filters before returning candidates.
+      - query_material: rendered into the search query text. Filter consumes
+        these via _collect_query_tokens (keyword coverage scoring + LLM criteria).
+        - topic, method (recall_mode=True), terms, query_skeleton, dataset, domain.
+      - judge_only: never sent to API or query; only Filter enforces.
+        - negation (hard rule _negation_hit).
+    """
     slots = ensure_query_skeleton(slots)
     usages: List[SlotUsage] = []
     api_filters: Dict[str, Any] = {}
 
+    # api_filter channel: hard constraints pushed to search API.
     for key in ("year_from", "year_to", "venue", "authors"):
         if _nonempty(slots.get(key)):
             api_filters[key] = slots[key]
             usages.append(SlotUsage(slot=key, channel="api_filter"))
 
+    # judge_only channel: hard rule in Filter (_negation_hit).
     if slots.get("negation"):
         usages.append(SlotUsage(slot="negation", channel="judge_only"))
 
+    # query_material channel: contributed to query text + filter keywords.
+    # method in recall_mode goes into query text so candidate set is broad;
+    # in precise mode it becomes an API filter (legacy behavior).
     method = slots.get("method")
     if _nonempty(method):
         if recall_mode:
-            usages.append(SlotUsage(slot="method", channel="judge_only"))
+            usages.append(SlotUsage(slot="method", channel="query_material"))
         else:
             api_filters["method"] = method
             usages.append(SlotUsage(slot="method", channel="api_filter"))
 
-    if slots.get("topic") or slots.get("query_skeleton"):
+    if slots.get("topic"):
+        usages.append(SlotUsage(slot="topic", channel="query_material"))
+
+    if slots.get("dataset"):
+        usages.append(SlotUsage(slot="dataset", channel="query_material"))
+
+    if slots.get("domain"):
+        usages.append(SlotUsage(slot="domain", channel="query_material"))
+
+    terms = slots.get("terms") or []
+    if terms:
+        usages.append(SlotUsage(slot="terms", channel="query_material"))
+
+    if slots.get("query_skeleton"):
         usages.append(SlotUsage(slot="query_skeleton", channel="query_material"))
 
     if intent == "specific":
@@ -426,3 +454,58 @@ def apply_usage_decision(
         question=question,
         add_survey_modifier=add_survey_modifier,
     )
+
+
+# ---------- Auto-decomposition decision ----------
+
+
+def _term_has_gap_with_instances(term: Dict[str, Any]) -> bool:
+    if not isinstance(term, dict):
+        return False
+    if term.get("coverage_gap_likely") is not True:
+        return False
+    instances = term.get("instances") or []
+    return any(str(x).strip() for x in instances)
+
+
+def should_auto_decompose(
+    slots: Dict[str, Any],
+    *,
+    intent: str = "",
+    min_required_parts: int = 2,
+    min_instances: int = 1,
+) -> bool:
+    """Decide whether to enable decomposition based on slot signals.
+
+    Decomposition is appropriate when:
+      1) Any term has coverage_gap_likely AND non-empty instances[].
+         (will swap that term's parts with each instance)
+      2) OR the query_skeleton has ≥ min_required_parts required replaceable
+         parts (multi-aspect: e.g. "X using Y on Z").
+
+    Returns False for `intent == "specific"` since specific queries need
+    precise navigation, not broad decomposition.
+    """
+    if intent == "specific":
+        return False
+
+    # Signal 1: any term has gap + instances
+    terms = slots.get("terms") or []
+    gap_with_inst = sum(
+        1 for t in terms if _term_has_gap_with_instances(t) if isinstance(t, dict)
+    )
+    if gap_with_inst >= min_instances:
+        return True
+
+    # Signal 2: multi-aspect skeleton (multiple required parts)
+    skeleton = slots.get("query_skeleton")
+    if isinstance(skeleton, dict):
+        parts = skeleton.get("parts") or []
+        required = [
+            p for p in parts
+            if isinstance(p, dict) and p.get("required") is True
+        ]
+        if len(required) >= min_required_parts:
+            return True
+
+    return False

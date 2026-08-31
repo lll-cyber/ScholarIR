@@ -81,6 +81,8 @@ def _run_one(
     f_opts: Dict[str, Any] = {
         "max_return": max_return,
         "arxiv_only": arxiv_only,
+        # 引用扩展：召回覆盖是当前瓶颈，从种子论文的 reference/citation 补池
+        "expand_citations": True,
     }
     return run(
         question,
@@ -101,7 +103,7 @@ def main() -> None:
     ap.add_argument("--split", choices=["auto", "real"], default="auto")
     ap.add_argument("--limit", type=int, default=5, help="max samples (default 5)")
     ap.add_argument("--offset", type=int, default=0)
-    ap.add_argument("--topk", type=int, default=10)
+    ap.add_argument("--topk", type=int, default=30)
     ap.add_argument("--max-subqueries", type=int, default=5)
     ap.add_argument("--max-return", type=int, default=20)
     ap.add_argument("--deepseek", action="store_true", help="Understanding via DeepSeek API")

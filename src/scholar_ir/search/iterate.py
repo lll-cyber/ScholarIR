@@ -16,11 +16,13 @@ from typing import Any, Dict, List, Optional
 
 from scholar_ir.llm import deepseek_chat, deepseek_configured
 from scholar_ir.search.base import retrieve
+from scholar_ir.search.dedup import canonical_paper_id
 from scholar_ir.types import PaperRef, RetrievalResult, SubQuery, UnderstandingResult
 
 
 def _paper_key(paper: PaperRef) -> str:
-    return (paper.paper_id or paper.title or "").strip().lower()
+    """Cross-source stable key for iterate's merge-dedup."""
+    return canonical_paper_id(paper)
 
 
 def _sample_titles(candidates: List[PaperRef], n: int = 5) -> List[str]:
@@ -179,7 +181,7 @@ def retrieve_iterative(
         understanding: 查询理解结果。
         options: 除 retrieve 的全部选项外，额外支持
             - iterate: 是否启用迭代校准（默认 True）
-            - target_min: 候选下限，低于则 broaden（默认 10）
+            - target_min: 候选下限，低于则 broaden（默认 40）
             - target_max: 候选上限，高于则 narrow（默认 200）
             - max_rounds: 额外补充检索轮数（默认 1）
             - refine_max_queries: 每轮生成的新查询数（默认 3）
@@ -195,7 +197,7 @@ def retrieve_iterative(
     if options.get("dry_run", False):
         return result
 
-    target_min = int(options.get("target_min", 10))
+    target_min = int(options.get("target_min", 40))
     target_max = int(options.get("target_max", 200))
     max_rounds = int(options.get("max_rounds", 1))
 

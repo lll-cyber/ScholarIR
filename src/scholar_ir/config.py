@@ -41,9 +41,9 @@ _load_env_files()
 PASA_TEST_JSONL = DATA_ROOT / "pasa-dataset" / "AutoScholarQuery" / "test.jsonl"
 PASA_REAL_JSONL = DATA_ROOT / "pasa-dataset" / "RealScholarQuery" / "test.jsonl"
 
-# Pipeline defaults (v0 demo)
-# semantic_scholar is optional: fast eval uses arxiv + openalex (no rate limits)
-DEFAULT_SOURCES = ["arxiv", "openalex"]
+# Pipeline defaults
+# 默认三源；S2 走 semantic_max_queries 预算，避免打满限流
+DEFAULT_SOURCES = ["arxiv", "openalex", "semantic"]
 DEFAULT_PER_QUERY_TOPK = 10
 DEFAULT_JUDGE_THRESHOLD = 0.5
 DEFAULT_MAX_RETURN = 20

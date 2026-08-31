@@ -1,25 +1,41 @@
 """Filter (stage-2): coarse rules + lightweight relevance scoring + optional citation expansion.
 
+Channel contract with query_understanding.slot_usage:
+  - api_filter slots (year_from/year_to/venue/authors): enforced at search stage;
+    year_from/year_to re-checked here as a defense-in-depth hard rule.
+  - query_material slots (topic, method, dataset, domain, terms, query_skeleton):
+    consumed via _collect_query_tokens (keyword coverage) and surfaced to the
+    LLM judge through relevance_criteria.
+  - judge_only slot (negation): enforced here as _negation_hit hard rule.
+
 Pipeline:
   1) Deduplicate candidates by paper_id / normalized title.
   2) Hard rules: year range, explicit negation.
   3) Lightweight keyword-coverage scoring on survivors (with synonyms/variants).
   4) LLM rescore on the Top-K survivors (optional; batched + concurrency degradation).
   5) Citation expansion: fetch references/citations of highly-relevant seeds (optional).
-  6) Score expanded papers and merge them back into the pool.
-  7) Intent-aware threshold + max_return truncation.
+  6) Intent-aware impact blending (citation / recency / venue / title density).
+  7) Cross-intent score normalization (threshold → 0.5 on public ``.score``).
+  8) Pass-bar (normalized ≥ 0.5) + max_return truncation.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
 import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from scholar_ir.embeddings import (
+    cosine_similarity,
+    embedding_configured,
+    encode,
+)
 from scholar_ir.llm import deepseek_chat, deepseek_configured
 from scholar_ir.eval import is_arxiv_id
+from scholar_ir.search.dedup import canonical_paper_id
 from scholar_ir.search.s2_client import (
     get_paper_citations,
     get_paper_references,
@@ -38,6 +54,28 @@ _STOPWORDS = {
     "what", "how", "any", "some", "me", "tell", "i", "we",
     # 泛化词汇：在学术查询中通常不具区分性
     "based", "using", "via", "techniques", "methods", "approaches",
+}
+
+# 顶会/顶刊子串（小写），用于 venue 影响力打分
+_TOP_VENUES = {
+    "neurips", "nips", "icml", "iclr", "cvpr", "iccv", "eccv",
+    "acl", "emnlp", "naacl", "coling", "tacl",
+    "aaai", "ijcai", "kdd", "www", "sigir", "icde", "mlsys",
+    "tpami", "ijcv", "jmlr", "tkde", "tods", "tois",
+    "nature", "science", "cell",
+}
+
+# Impact 子信号按 intent 分配的权重（关键词+LLM+语义相似度+引用+年份+venue+title 密度）。
+# 各 intent 的总权重=1。intent 未命中时退回 default。
+# embedding 权重从 rel 中划出：语义相似度与关键词相关性度量的是同一件事
+# （查询-论文匹配程度），不应挤压 citation/recency 等独立工程特征的份额。
+# embedding 服务不可用时，_blend_score 会把该权重回补给 rel。
+_IMPACT_WEIGHTS: Dict[str, Dict[str, float]] = {
+    "method":   {"rel": 0.68, "embedding": 0.12, "citation": 0.05, "recency": 0.05, "venue": 0.04, "title": 0.06},
+    "survey":   {"rel": 0.45, "embedding": 0.10, "citation": 0.18, "recency": 0.10, "venue": 0.10, "title": 0.07},
+    "specific": {"rel": 0.66, "embedding": 0.12, "citation": 0.04, "recency": 0.04, "venue": 0.04, "title": 0.10},
+    "broad":    {"rel": 0.66, "embedding": 0.12, "citation": 0.06, "recency": 0.06, "venue": 0.05, "title": 0.05},
+    "default":  {"rel": 0.66, "embedding": 0.12, "citation": 0.06, "recency": 0.06, "venue": 0.05, "title": 0.05},
 }
 
 
@@ -62,20 +100,20 @@ def _paper_text(paper: PaperRef) -> str:
     return _normalize_text(f"{paper.title} {paper.abstract}")
 
 
-def _paper_key(paper: PaperRef) -> str:
-    """去重 key：优先 paper_id，否则规范化标题。"""
-    key = (paper.paper_id or "").strip()
-    if key:
-        return key
-    return re.sub(r"[^a-z0-9]+", "", (paper.title or "").lower())
+def _paper_key(paper: PaperRef, *, index: Optional[int] = None) -> str:
+    """Cross-source stable key: arxiv > DOI > title+pid > index sentinel.
+
+    `index` disambiguates papers with no identifier at all (last-resort).
+    """
+    return canonical_paper_id(paper, index=index)
 
 
 def _deduplicate(candidates: List[PaperRef]) -> List[PaperRef]:
-    """按 paper_id 去重；无 id 时按规范化标题去重。"""
+    """Deduplicate candidates across sources by canonical id."""
     seen: Set[str] = set()
     out: List[PaperRef] = []
-    for p in candidates:
-        key = _paper_key(p)
+    for i, p in enumerate(candidates):
+        key = _paper_key(p, index=i)
         if not key or key in seen:
             continue
         seen.add(key)
@@ -206,6 +244,212 @@ def _intent_threshold(intent: str, override: Optional[float]) -> float:
     if intent_norm == "method":
         return 0.15
     return 0.25
+
+
+# ---------- Impact signals (merged from ranking) ----------
+
+
+def _citation_count(paper: PaperRef) -> int:
+    """从不同 source 的 raw 里尽量读出引用数。"""
+    raw = paper.raw or {}
+    for key in ("citationCount", "citation_count", "cited_by_count", "num_cited_by"):
+        val = raw.get(key)
+        if isinstance(val, int):
+            return max(0, val)
+        if isinstance(val, str) and val.isdigit():
+            return max(0, int(val))
+    return 0
+
+
+def _venue_str(paper: PaperRef) -> str:
+    raw = paper.raw or {}
+    for key in ("venue", "journal", "publicationVenue"):
+        val = raw.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.lower()
+    return ""
+
+
+def _citation_score(paper: PaperRef, max_citations: int) -> float:
+    if max_citations <= 0:
+        return 0.0
+    return math.log1p(_citation_count(paper)) / math.log1p(max_citations)
+
+
+def _recency_score(paper: PaperRef, min_year: int, max_year: int) -> float:
+    if paper.year is None or max_year <= min_year:
+        return 0.5
+    return (paper.year - min_year) / (max_year - min_year)
+
+
+def _venue_score(paper: PaperRef) -> float:
+    venue = _venue_str(paper)
+    if not venue:
+        return 0.0
+    for top in _TOP_VENUES:
+        if top in venue:
+            return 1.0
+    return 0.0
+
+
+def _title_density_score(paper: PaperRef, query_tokens: Set[str]) -> float:
+    if not query_tokens:
+        return 0.0
+    title_tokens = _extract_tokens(paper.title or "")
+    if not title_tokens:
+        return 0.0
+    matched = query_tokens & title_tokens
+    return len(matched) / len(query_tokens)
+
+
+def _impact_weights(intent: str, override: Optional[Dict[str, float]]) -> Dict[str, float]:
+    """选择 intent 对应的权重表；用户可显式覆盖。"""
+    if override:
+        return dict(override)
+    intent_norm = (intent or "").lower()
+    return dict(_IMPACT_WEIGHTS.get(intent_norm) or _IMPACT_WEIGHTS["default"])
+
+
+def _compute_impact_stats(
+    papers: List[PaperRef],
+) -> Tuple[int, int, int]:
+    """统计引用数与年份的最大最小值，用于 citation / recency 归一化。"""
+    citations = [_citation_count(p) for p in papers]
+    years = [p.year for p in papers if p.year is not None]
+    max_citations = max(citations) if citations else 0
+    min_year = min(years) if years else 2000
+    max_year = max(years) if years else 2026
+    return max_citations, min_year, max_year
+
+
+def _impact_features(
+    paper: PaperRef,
+    query_tokens: Set[str],
+    max_citations: int,
+    min_year: int,
+    max_year: int,
+) -> Dict[str, float]:
+    """单篇论文的 4 个外部影响子信号。"""
+    return {
+        "citation": round(_citation_score(paper, max_citations), 4),
+        "recency": round(_recency_score(paper, min_year, max_year), 4),
+        "venue": round(_venue_score(paper), 4),
+        "title": round(_title_density_score(paper, query_tokens), 4),
+    }
+
+
+def _embed_query_text(understanding: UnderstandingResult) -> str:
+    """query 侧编码文本：优先 query_skeleton.core_text。
+
+    core_text 已由 understanding 剥离「Which papers ...」这类疑问外壳，
+    比原始问句更接近论文摘要的陈述式表述；缺失时回退到原始问题。
+    """
+    slots = understanding.slots or {}
+    skeleton = slots.get("query_skeleton")
+    if isinstance(skeleton, dict):
+        core = (skeleton.get("core_text") or "").strip()
+        if core:
+            return core
+    return (understanding.raw_question or "").strip()
+
+
+def _embed_doc_text(paper: PaperRef) -> str:
+    """doc 侧编码文本：title + abstract。
+
+    不含 venue / year —— 它们已在 _venue_score / _recency_score 里作为
+    独立特征参与融合，重复放进向量文本会重复计权。
+    """
+    parts = [paper.title or ""]
+    abstract = getattr(paper, "abstract", "") or ""
+    if abstract:
+        parts.append(abstract)
+    return " ".join(p for p in parts if p).strip()
+
+
+def _embedding_scores(
+    understanding: UnderstandingResult,
+    papers: List[PaperRef],
+) -> List[float]:
+    """批量计算 query 与各论文的语义相似度，返回与 ``papers`` 等长的分数列表。
+
+    服务未配置或任一环节失败时返回空列表，由调用方降级（不阻断主流程）。
+    无摘要且无标题的论文得 0 分。
+    """
+    if not papers or not embedding_configured():
+        return []
+
+    query_text = _embed_query_text(understanding)
+    if not query_text:
+        return []
+
+    doc_texts = [_embed_doc_text(p) for p in papers]
+    # 只对非空文本请求编码，空文本直接给 0
+    fillable = [i for i, t in enumerate(doc_texts) if t]
+    if not fillable:
+        return []
+
+    vectors = encode([query_text] + [doc_texts[i] for i in fillable])
+    if not vectors or len(vectors) != len(fillable) + 1:
+        return []
+
+    query_vector = vectors[0]
+    scores = [0.0] * len(papers)
+    for pos, vec in zip(fillable, vectors[1:]):
+        scores[pos] = round(cosine_similarity(query_vector, vec), 4)
+    return scores
+
+
+def _blend_score(
+    relevance: float,
+    impact: Dict[str, float],
+    weights: Dict[str, float],
+) -> float:
+    """rel (keyword+llm) 与 impact 子信号按 weights 融合，归一到 [0, 1]。
+
+    ``impact`` 缺少 embedding 键时（服务不可用），其权重回补给 rel，
+    保证总权重恒为 1，分数尺度与阈值判定不因降级而漂移。
+    """
+    rel_w = float(weights.get("rel", 0.0))
+    emb_w = float(weights.get("embedding", 0.0))
+    if "embedding" in impact:
+        emb_term = emb_w * float(impact["embedding"])
+    else:
+        rel_w += emb_w
+        emb_term = 0.0
+    rel = max(0.0, min(1.0, relevance))
+    raw = (
+        rel_w * rel
+        + emb_term
+        + float(weights.get("citation", 0.0)) * float(impact["citation"])
+        + float(weights.get("recency", 0.0)) * float(impact["recency"])
+        + float(weights.get("venue", 0.0)) * float(impact["venue"])
+        + float(weights.get("title", 0.0)) * float(impact["title"])
+    )
+    return round(max(0.0, min(1.0, raw)), 4)
+
+
+def _normalize_cross_intent(score: float, threshold: float) -> float:
+    """把 raw score 映射到跨 intent 可比的尺度：threshold → 0.5。
+
+    不同 intent 的 `_intent_threshold` / impact 权重不同，同一 raw 分不可直接比。
+    以该 intent 的通过门槛为锚点做分段线性映射：
+      - score <= 0           → 0（硬规则丢弃）
+      - [0, threshold]       → [0, 0.5]
+      - [threshold, 1]       → [0.5, 1]
+    这样「刚好过线」在所有 intent 上都是 ~0.5，下游 organize / ranking
+    可用统一阈值解读。
+    """
+    s = max(0.0, min(1.0, float(score)))
+    if s <= 0.0:
+        return 0.0
+    t = max(0.0, min(1.0, float(threshold)))
+    if t <= 0.0:
+        # 无通过门槛：保持原分
+        return round(s, 4)
+    if s >= t:
+        span = max(1e-9, 1.0 - t)
+        return round(0.5 + 0.5 * (s - t) / span, 4)
+    return round(0.5 * s / t, 4)
 
 
 def _score_paper(
@@ -602,16 +846,28 @@ def filter_papers(
     candidates: List[PaperRef],
     options: Dict[str, Any] | None = None,
 ) -> JudgeResult:
-    """Coarse filter + lightweight scoring + optional LLM rescore + citation expansion.
+    """Coarse filter + lightweight scoring + optional LLM rescore + citation expansion
+    + impact-aware blending.
+
+    Pipeline:
+      1) Deduplicate candidates by paper_id / normalized title.
+      2) Hard rules: year range, explicit negation.
+      3) Lightweight keyword-coverage scoring on survivors (with synonyms/variants).
+      4) LLM rescore on the Top-K survivors (optional; batched + concurrency degradation).
+      5) Citation expansion: fetch references/citations of highly-relevant seeds (optional).
+      6) Intent-aware impact blending: blend relevance score with citation/recency/venue/
+         title_density using intent-specific weights, then re-sort.
+      7) Cross-intent score normalization (threshold → 0.5) + max_return truncation.
 
     Args:
         understanding: Query understanding result with intent/slots/criteria.
         candidates: Papers returned from search stage.
         options: Controls for threshold, max_return, and rule switches.
-            - threshold: minimum score to keep (auto by intent if omitted)
+            - threshold: raw-score pass bar before normalization (auto by intent if omitted)
             - max_return: maximum papers to return (default 20)
-            - arxiv_only: if True (default), drop non-arXiv ids before truncation
-              so W… / S2 hash do not occupy max_return slots (PaSa-friendly)
+            - arxiv_only: if True, drop non-arXiv ids before truncation so W… /
+              S2 hash do not occupy max_return slots (PaSa-friendly).
+              Default False; eval/smoke should pass True when scoring arXiv gold.
             - rule_year: enable year filtering (default True)
             - rule_negation: enable negation filtering (default True)
             - use_llm: enable LLM rescore on Top-K survivors (default True)
@@ -628,9 +884,23 @@ def filter_papers(
             - expand_max_total: max expanded papers (default 30)
             - use_llm_for_expanded: LLM judge for expanded papers (default True)
             - llm_top_k_expanded: LLM top-k for expanded papers (default 10)
+            - apply_impact: enable impact blending (default True). Set False for legacy
+              behavior where the pre-normalize score == relevance only.
+            - use_embedding: enable semantic similarity signal (default True). Requires
+              EMBEDDING_API_* config; silently degrades when unavailable.
+            - embedding_top_k: max papers sent to the embedding service (default 100).
+            - impact_weights: override intent-aware weight table (Dict[str, float]).
+
+    Note:
+        ``understanding.relevance_criteria`` (including required method/topic) are
+        soft signals for the LLM judge prompt. Keyword path does **not** hard-zero
+        papers that omit a required method string (avoids brittle recall loss).
 
     Returns:
-        JudgeResult with scored/selected/paper_ids.
+        JudgeResult with scored/selected/paper_ids. Each ScoredPaper.features contains
+        sub-signals: keyword_coverage, llm (optional), relevance, citation, recency,
+        venue, title, blended (if impact on), normalized (final ``.score``).
+        ``.score`` is always the cross-intent normalized value (pass bar ≈ 0.5).
     """
     options = options or {}
     max_return = int(options.get("max_return", 20))
@@ -647,7 +917,16 @@ def filter_papers(
     scored: List[ScoredPaper] = []
     for paper in deduped:
         score, reason = _score_paper(paper, understanding, options)
-        scored.append(ScoredPaper(paper=paper, score=score, reason=reason))
+        # 在 features 里记录 keyword 子信号
+        kw_score = float(score) if "keyword_coverage" in reason else 0.0
+        scored.append(
+            ScoredPaper(
+                paper=paper,
+                score=score,
+                reason=reason,
+                features={"keyword_coverage": round(kw_score, 4)},
+            )
+        )
 
     # 按关键词分数初步排序
     scored_sorted = sorted(scored, key=lambda s: s.score, reverse=True)
@@ -669,9 +948,10 @@ def filter_papers(
                     llm_score, llm_reason = llm_map[pid]
                     s.score = round(llm_score, 4)
                     s.reason = f"llm:{llm_score};{llm_reason}"
+                    s.features["llm"] = round(llm_score, 4)
 
     # 用 LLM 更新后的分数重新排序
-    scored_sorted = sorted(scored, key=lambda s: s.score, reverse=True)
+    scored_sorted = sorted(scored_sorted, key=lambda s: s.score, reverse=True)
 
     # 引用扩展（可选）
     if options.get("expand_citations", False):
@@ -686,7 +966,83 @@ def filter_papers(
                 scored_sorted.extend(expanded_scored)
                 scored_sorted = sorted(scored_sorted, key=lambda s: s.score, reverse=True)
 
-    survivors = [s.paper for s in scored_sorted if s.score >= threshold]
+    # Intent-aware impact blending (embedding / citation / recency / venue / title density)
+    if options.get("apply_impact", True):
+        weights = _impact_weights(understanding.intent, options.get("impact_weights"))
+        # 排除硬规则丢弃的 score=0：它们没机会跑 impact（除非显式要求）
+        all_papers = [s.paper for s in scored_sorted]
+        max_citations, min_year, max_year = _compute_impact_stats(all_papers)
+        query_tokens = _collect_query_tokens(understanding)
+
+        # 语义相似度：只对通过硬规则的论文编码，省调用；失败返回空列表后降级
+        emb_by_id: Dict[int, float] = {}
+        if options.get("use_embedding", True):
+            emb_candidates = [s for s in scored_sorted if s.score > 0.0]
+            emb_top_k = int(options.get("embedding_top_k", 100))
+            if emb_top_k > 0:
+                emb_candidates = emb_candidates[:emb_top_k]
+            if emb_candidates:
+                emb_scores = _embedding_scores(
+                    understanding, [s.paper for s in emb_candidates]
+                )
+                if emb_scores:
+                    emb_by_id = {
+                        id(s): sc for s, sc in zip(emb_candidates, emb_scores)
+                    }
+
+        for s in scored_sorted:
+            if s.score <= 0.0:
+                # 硬规则丢弃的论文：保持 score=0 + 标记原因，不参与 impact
+                s.features["impact_skipped"] = True
+                continue
+            impact = _impact_features(
+                s.paper, query_tokens, max_citations, min_year, max_year
+            )
+            if id(s) in emb_by_id:
+                impact["embedding"] = emb_by_id[id(s)]
+            s.features.update(impact)
+            rel_for_blend = float(
+                s.features.get("llm", s.features.get("keyword_coverage", 0.0))
+            )
+            s.features["relevance"] = round(rel_for_blend, 4)
+            new_score = _blend_score(rel_for_blend, impact, weights)
+            s.features["blended"] = new_score
+            s.score = new_score
+            # reason 加入 impact 概览
+            emb_part = (
+                f"emb={impact['embedding']}," if "embedding" in impact else ""
+            )
+            impact_summary = (
+                f"impact[{emb_part}"
+                f"cit={impact['citation']},"
+                f"rec={impact['recency']},"
+                f"ven={impact['venue']},"
+                f"ttl={impact['title']}]"
+            )
+            s.reason = f"{s.reason};{impact_summary}"
+        scored_sorted = sorted(scored_sorted, key=lambda s: s.score, reverse=True)
+
+    # Cross-intent normalization: threshold → 0.5 on the public `.score`
+    for s in scored_sorted:
+        if s.score <= 0.0:
+            s.features.setdefault("relevance", 0.0)
+            s.features["normalized"] = 0.0
+            s.score = 0.0
+            continue
+        if "relevance" not in s.features:
+            s.features["relevance"] = round(
+                float(s.features.get("llm", s.features.get("keyword_coverage", 0.0))),
+                4,
+            )
+        raw = float(s.score)
+        norm = _normalize_cross_intent(raw, threshold)
+        s.features["normalized"] = norm
+        s.score = norm
+    scored_sorted = sorted(scored_sorted, key=lambda s: s.score, reverse=True)
+
+    # After normalization, pass bar is 0.5 (threshold→0.5); threshold<=0 keeps all.
+    pass_bar = 0.5 if threshold > 0.0 else 0.0
+    survivors = [s.paper for s in scored_sorted if s.score >= pass_bar]
     if arxiv_only:
         # Non-arXiv ids never match PaSa gold; drop before max_return so they
         # do not crowd out arXiv papers.

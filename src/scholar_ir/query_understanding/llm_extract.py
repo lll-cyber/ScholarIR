@@ -46,6 +46,15 @@ PROMPT = """Extract a LIGHT Round-1 schema for academic paper search. Rules:
   false when standard terms already retrieve well.
 - query_skeleton: core_text preserves relations; parts MUST be non-overlapping exact
   substrings of core_text (longest span wins if nested).
+- dataset / domain: application context — data resources, benchmarks, corpora,
+  or disciplinary area. Fill when the question implies WHERE or IN WHICH CONTEXT
+  a topic/method is discussed (e.g. "in medical imaging", "on ImageNet",
+  "for NLP"). Leave null when not specified. Both are optional hints for
+  keyword coverage scoring — not API filter constraints.
+- topic / method: the query's primary subject and approach (mirrors term_groups
+  role tags for redundancy). topic = the main concept/area; method = the
+  algorithm / technique / framework named. Leave null when not specified.
+  These are optional hints for keyword coverage scoring.
 
 ## term_groups
 - canonical: preferred indexing phrase
@@ -80,6 +89,10 @@ Return ONLY valid JSON:
   }},
   "coverage_gap_likely": true/false,
   "claim": "<proposition text or null>",
+  "topic": "<primary subject or null>",
+  "method": "<primary approach/framework or null>",
+  "dataset": "<data resource / benchmark / corpus name or null>",
+  "domain": "<disciplinary or application area or null>",
   "term_groups": [
     {{
       "canonical": "<concept>",

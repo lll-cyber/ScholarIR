@@ -28,6 +28,80 @@ def test_recall_mode_drops_method_filter() -> None:
     assert plan.api_filters.get("year_from") == 2020
     assert "method" not in plan.api_filters
     assert any(t.transform == "core" for t in plan.tasks)
+    # method is query_material in recall mode (new policy)
+    method_usage = [u for u in plan.slot_usages if u.slot == "method"]
+    assert method_usage and method_usage[0].channel == "query_material"
+
+
+def test_channel_alignment_full() -> None:
+    """All slot → channel mappings must match the contract documented in
+    filter/base.py and slot_usage.apply_slot_usage."""
+    slots = ensure_topic_term(
+        {
+            "topic": "video generation",
+            "method": "diffusion",
+            "dataset": "ImageNet",
+            "domain": "computer vision",
+            "year_from": 2020,
+            "year_to": 2025,
+            "venue": "CVPR",
+            "authors": ["Vaswani"],
+            "negation": ["GAN"],
+            "terms": [
+                empty_term("video generation", "topic"),
+                empty_term("diffusion", "method"),
+            ],
+            "query_skeleton": {
+                "core_text": "diffusion video generation",
+                "parts": [
+                    {"id": "t0", "text": "diffusion", "required": True, "replaceable": False},
+                    {"id": "t1", "text": "video generation", "required": True, "replaceable": False},
+                ],
+            },
+        }
+    )
+    plan = apply_slot_usage("method", slots, recall_mode=True, max_n=5)
+
+    by_slot = {u.slot: u.channel for u in plan.slot_usages}
+
+    # api_filter
+    assert by_slot["year_from"] == "api_filter"
+    assert by_slot["year_to"] == "api_filter"
+    assert by_slot["venue"] == "api_filter"
+    assert by_slot["authors"] == "api_filter"
+    # judge_only
+    assert by_slot["negation"] == "judge_only"
+    # query_material
+    for key in ("topic", "method", "dataset", "domain", "terms", "query_skeleton"):
+        assert by_slot.get(key) == "query_material", f"{key} should be query_material"
+
+
+def test_channel_alignment_precise_mode_method_filter() -> None:
+    slots = ensure_topic_term(
+        {
+            "topic": "diffusion",
+            "method": "diffusion",
+            "terms": [empty_term("diffusion", "topic")],
+        }
+    )
+    plan = apply_slot_usage("method", slots, recall_mode=False, max_n=5)
+    by_slot = {u.slot: u.channel for u in plan.slot_usages}
+    assert by_slot["method"] == "api_filter"
+    assert plan.api_filters.get("method") == "diffusion"
+
+
+def test_channel_alignment_missing_optional_slots() -> None:
+    """Slots that are absent must not appear in slot_usages (no false positives)."""
+    slots = ensure_topic_term({"topic": "RAG", "terms": []})
+    plan = apply_slot_usage("survey", slots, recall_mode=True, max_n=5)
+    by_slot = {u.slot: u.channel for u in plan.slot_usages}
+    # negation absent
+    assert "negation" not in by_slot
+    # dataset / domain absent
+    assert "dataset" not in by_slot
+    assert "domain" not in by_slot
+    # topic present → query_material
+    assert by_slot.get("topic") == "query_material"
 
 
 def test_specific_keeps_lexical_and_true_metadata() -> None:
@@ -399,6 +473,9 @@ def test_coverage_gap_helper() -> None:
 
 if __name__ == "__main__":
     test_recall_mode_drops_method_filter()
+    test_channel_alignment_full()
+    test_channel_alignment_precise_mode_method_filter()
+    test_channel_alignment_missing_optional_slots()
     test_specific_keeps_lexical_and_true_metadata()
     test_specific_allows_lexical_variants()
     test_skeleton_swap_keeps_all_required_parts()
