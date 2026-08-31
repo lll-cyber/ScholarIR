@@ -1,8 +1,8 @@
 """Orchestrator — four stages (赛题流水线):
 
   (1) query_understanding  查询理解与分解
-  (2) search + filter      自主搜索 + 过滤不相干/低质量（迭代策略后续补）
-  (3) ranking              论文综合排序（骨架）
+  (2) search + filter      自主搜索（含 broaden/narrow 迭代）+ 过滤不相干/低质量
+  (3) ranking              论文综合排序（多特征 + embedding 融合）
   (4) organize             搜索结果归纳整理（骨架）
 """
 
@@ -15,7 +15,7 @@ from scholar_ir.filter import filter_papers
 from scholar_ir.organize import organize
 from scholar_ir.query_understanding import understand
 from scholar_ir.ranking import rank
-from scholar_ir.search import retrieve
+from scholar_ir.search import retrieve_iterative
 from scholar_ir.search.s2_client import reset_rate_limiter
 from scholar_ir.types import PipelineResult
 
@@ -30,9 +30,9 @@ def run(question: str, options: Dict[str, Any] | None = None) -> PipelineResult:
     u_opts = options.get("query_understanding") or options.get("understanding")
     understanding = understand(question, u_opts)
 
-    # (2) 自主搜索 + 候选过滤（搜索策略迭代优化：当前为检索 + stub 过滤）
+    # (2) 自主搜索（候选不足自动 broaden / 过多自动 narrow）+ 候选过滤
     s_opts = options.get("search") or options.get("retrieval")
-    retrieval = retrieve(understanding, s_opts)
+    retrieval = retrieve_iterative(understanding, s_opts)
 
     f_opts = options.get("filter") or options.get("judge")
     filter_result = filter_papers(

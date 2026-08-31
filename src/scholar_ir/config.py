@@ -71,6 +71,15 @@ DEEPSEEK_THINKING = os.getenv("DEEPSEEK_THINKING", "0").lower() in ("1", "true",
 # LLM backend preference: deepseek | local | openai | auto
 SCHOLAR_IR_LLM_BACKEND = os.getenv("SCHOLAR_IR_LLM_BACKEND", "auto").lower()
 
+# Embedding API (OpenAI-compatible /v1/embeddings; e.g. RAGFlow / vLLM / SiliconFlow)
+# EMBEDDING_MODEL may be a comma-separated fallback list.
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "").strip().strip('"').strip("'")
+EMBEDDING_API_BASE = os.getenv("EMBEDDING_API_BASE", "").strip().strip('"').strip("'")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "bge-m3").strip().strip('"').strip("'")
+EMBEDDING_TIMEOUT = float(os.getenv("EMBEDDING_TIMEOUT", "30"))
+EMBEDDING_MAX_CHARS = int(os.getenv("EMBEDDING_MAX_CHARS", "1800"))
+EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "32"))
+
 # Local LLM (Understanding): ScholarIR/LLMS/qwen2.5-gptq
 LOCAL_QWEN_GPTQ_PATH = Path(
     os.getenv(

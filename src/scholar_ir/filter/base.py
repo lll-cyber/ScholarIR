@@ -4,7 +4,7 @@ Pipeline:
   1) Deduplicate candidates by paper_id / normalized title.
   2) Hard rules: year range, explicit negation.
   3) Lightweight keyword-coverage scoring on survivors (with synonyms/variants).
-  4) LLM rescore on the Top-K survivors (optional).
+  4) LLM rescore on the Top-K survivors (optional; batched + concurrency degradation).
   5) Citation expansion: fetch references/citations of highly-relevant seeds (optional).
   6) Score expanded papers and merge them back into the pool.
   7) Intent-aware threshold + max_return truncation.
@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import re
 import textwrap
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from scholar_ir.llm import deepseek_chat, deepseek_configured
@@ -366,20 +367,31 @@ def _parse_llm_json(
     return result
 
 
-def _llm_rescore_topk(
+def _concurrency_schedule(configured: int) -> List[int]:
+    """并发降级阶梯，例如 8 -> [8, 4, 1]。"""
+    schedule: List[int] = []
+    for tier in (32, 16, 8, 4, 1):
+        if tier <= configured and tier not in schedule:
+            schedule.append(tier)
+    if not schedule:
+        schedule.append(1)
+    elif schedule[-1] != 1:
+        schedule.append(1)
+    return schedule
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "429" in text or "rate_limit" in text or "too many requests" in text
+
+
+def _score_one_batch(
     understanding: UnderstandingResult,
     papers: List[PaperRef],
     options: Dict[str, Any],
     seed_notes: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Tuple[float, str]]:
-    """用 LLM 对 Top-K 候选重新打分。失败返回空 dict。"""
-    if not options.get("use_llm", True):
-        return {}
-    if not papers:
-        return {}
-    if not deepseek_configured():
-        return {}
-
+    """对一个 batch 调用一次 LLM。失败抛异常，由调用方决定是否重试。"""
     prompt = _build_llm_prompt(understanding, papers, seed_notes=seed_notes)
     response = deepseek_chat(
         [
@@ -390,9 +402,75 @@ def _llm_rescore_topk(
         max_tokens=int(options.get("llm_max_tokens", 1024)),
     )
     if not response:
+        raise RuntimeError("empty LLM response")
+
+    parsed = _parse_llm_json(response, [p.paper_id for p in papers if p.paper_id])
+    if not parsed:
+        raise RuntimeError("unparseable LLM response")
+    return parsed
+
+
+def _llm_rescore_topk(
+    understanding: UnderstandingResult,
+    papers: List[PaperRef],
+    options: Dict[str, Any],
+    seed_notes: Optional[Dict[str, str]] = None,
+) -> Dict[str, Tuple[float, str]]:
+    """用 LLM 对 Top-K 候选分 batch 并发打分。
+
+    - 候选按 llm_batch_size 切分，避免单次 prompt 过长导致截断。
+    - 并发按 llm_concurrency 起步，失败的 batch 在更低并发档位重试（如 8 -> 4 -> 1）。
+    - 触发限流时立即整体降档，避免继续打满。
+    - 全部失败返回空 dict，调用方沿用关键词分数。
+    """
+    if not options.get("use_llm", True):
+        return {}
+    if not papers:
+        return {}
+    if not deepseek_configured():
         return {}
 
-    return _parse_llm_json(response, [p.paper_id for p in papers if p.paper_id])
+    batch_size = max(1, int(options.get("llm_batch_size", 8)))
+    batches = [papers[i : i + batch_size] for i in range(0, len(papers), batch_size)]
+
+    result: Dict[str, Tuple[float, str]] = {}
+    if len(batches) == 1:
+        try:
+            return _score_one_batch(understanding, batches[0], options, seed_notes)
+        except Exception:
+            return {}
+
+    configured = min(32, max(1, int(options.get("llm_concurrency", 8))))
+    remaining = list(enumerate(batches, 1))
+    for tier in _concurrency_schedule(configured):
+        if not remaining:
+            break
+        failed: List[Tuple[int, List[PaperRef]]] = []
+        worklist = list(remaining)
+        backoff = False
+        for start in range(0, len(worklist), tier):
+            chunk = worklist[start : start + tier]
+            with ThreadPoolExecutor(max_workers=tier) as executor:
+                futures = {
+                    executor.submit(
+                        _score_one_batch, understanding, batch, options, seed_notes
+                    ): (idx, batch)
+                    for idx, batch in chunk
+                }
+                for future in as_completed(futures):
+                    idx, batch = futures[future]
+                    try:
+                        result.update(future.result())
+                    except Exception as exc:
+                        failed.append((idx, batch))
+                        if _is_rate_limit_error(exc):
+                            backoff = True
+            if backoff:
+                failed.extend(worklist[start + len(chunk) :])
+                break
+        remaining = failed
+
+    return result
 
 
 def _select_seeds(
@@ -538,6 +616,8 @@ def filter_papers(
             - rule_negation: enable negation filtering (default True)
             - use_llm: enable LLM rescore on Top-K survivors (default True)
             - llm_top_k: number of survivors to send to LLM (default 15)
+            - llm_batch_size: candidates per LLM call (default 8)
+            - llm_concurrency: initial parallel LLM calls, degrades on failure (default 8)
             - llm_temperature: LLM temperature (default 0.2)
             - llm_max_tokens: LLM max tokens (default 1024)
             - expand_citations: enable citation expansion (default False)
@@ -554,7 +634,7 @@ def filter_papers(
     """
     options = options or {}
     max_return = int(options.get("max_return", 20))
-    arxiv_only = bool(options.get("arxiv_only", True))
+    arxiv_only = bool(options.get("arxiv_only", False))
     threshold = _intent_threshold(
         understanding.intent,
         options.get("threshold"),

@@ -1,9 +1,10 @@
-"""Stage (2) 自主搜索：多源检索（arxiv / openalex / semantic）。
+"""Stage (2) 自主搜索：多源检索（arxiv / openalex / semantic）+ 迭代校准。
 
-与 `filter` 共同构成「搜索策略」阶段；迭代式检索后续补齐。
+与 `filter` 共同构成「搜索策略」阶段。
 """
 
 from .base import paper_dict_to_ref, retrieve
+from .iterate import retrieve_iterative
 from . import s2_client
 from .adapt import (
     adapt_arxiv,
@@ -17,6 +18,7 @@ from .adapt import (
 
 __all__ = [
     "retrieve",
+    "retrieve_iterative",
     "paper_dict_to_ref",
     "s2_client",
     "adapt_semantic",

@@ -9,6 +9,7 @@
 
 融合特征：
   - filter_score: filter 阶段的相关度分数（主信号）
+  - embedding_score: query 与 title+abstract 的向量余弦相似度（外部 API，失败自动降级）
   - citation_score: 引用数权威性（对数归一化）
   - recency_score: 年份新度
   - venue_score: 顶会/顶刊加分
@@ -21,6 +22,7 @@ import math
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from scholar_ir.embeddings import cosine_similarity, embedding_configured, encode
 from scholar_ir.types import JudgeResult, PaperRef, ScoredPaper, UnderstandingResult
 
 # 轻量停用词表（与 filter/base.py 保持一致即可）
@@ -182,6 +184,44 @@ def _title_density_score(paper: PaperRef, query_tokens: Set[str]) -> float:
     return len(matched) / len(query_tokens)
 
 
+def _query_text_for_embedding(understanding: UnderstandingResult) -> str:
+    """构造用于 embedding 的 query 文本：原始问题 + 核心骨架。"""
+    parts: List[str] = [understanding.raw_question or ""]
+    slots = understanding.slots or {}
+    skeleton = slots.get("query_skeleton")
+    if isinstance(skeleton, dict):
+        core = skeleton.get("core_text")
+        if isinstance(core, str) and core.strip():
+            parts.append(core.strip())
+    return " ".join(p for p in parts if p).strip()
+
+
+def _compute_embedding_scores(
+    understanding: UnderstandingResult,
+    papers: List[PaperRef],
+) -> Dict[str, float]:
+    """批量计算 embedding 相似度。不可用时返回空 dict（调用方降级）。"""
+    if not embedding_configured() or not papers:
+        return {}
+
+    query_text = _query_text_for_embedding(understanding)
+    if not query_text:
+        return {}
+
+    doc_texts = [_normalize_text(f"{p.title} {p.abstract}") for p in papers]
+    vectors = encode([query_text] + doc_texts)
+    if not vectors:
+        return {}
+
+    query_vec = vectors[0]
+    scores: Dict[str, float] = {}
+    for paper, vec in zip(papers, vectors[1:]):
+        key = paper.paper_id or paper.title
+        if key:
+            scores[key] = round(cosine_similarity(query_vec, vec), 4)
+    return scores
+
+
 def _rank_score(
     scored: ScoredPaper,
     understanding: UnderstandingResult,
@@ -197,18 +237,33 @@ def _rank_score(
     venue = _venue_score(paper)
     title_density = _title_density_score(paper, stats["query_tokens"])
 
+    embedding_scores: Dict[str, float] = stats.get("embedding_scores") or {}
+    has_embedding = bool(embedding_scores)
+    embedding = embedding_scores.get(paper.paper_id or paper.title, 0.0)
+
+    if has_embedding:
+        w_filter = weights.get("filter", 0.40)
+        w_embedding = weights.get("embedding", 0.15)
+    else:
+        # embedding 不可用时把权重让回 filter，保持总权重为 1
+        w_filter = weights.get("filter", 0.40) + weights.get("embedding", 0.15)
+        w_embedding = 0.0
+
     final = (
-        weights.get("filter", 0.50) * filter_score +
+        w_filter * filter_score +
+        w_embedding * embedding +
         weights.get("citation", 0.20) * citation +
         weights.get("recency", 0.15) * recency +
-        weights.get("venue", 0.10) * venue +
+        weights.get("venue", 0.05) * venue +
         weights.get("title", 0.05) * title_density
     )
     final = round(max(0.0, min(1.0, final)), 4)
 
     reason = (
         f"rank={final}; "
-        f"filter={filter_score}, citation={round(citation,2)}, "
+        f"filter={filter_score}, "
+        f"{'embed=' + str(round(embedding, 2)) + ', ' if has_embedding else ''}"
+        f"citation={round(citation,2)}, "
         f"recency={round(recency,2)}, venue={round(venue,2)}, "
         f"title={round(title_density,2)}"
     )
@@ -228,8 +283,11 @@ def rank(
         options: 配置项
             - max_return: 最终返回数量（默认 20）
             - weights: 各特征权重，默认
-                {filter: 0.5, citation: 0.2, recency: 0.15, venue: 0.1, title: 0.05}
+                {filter: 0.4, embedding: 0.15, citation: 0.2, recency: 0.15,
+                 venue: 0.05, title: 0.05}
             - threshold: 最低综合分（默认 0.0，不过滤）
+            - use_embedding: 是否启用外部 embedding 相似度（默认 True，
+              服务不可用时自动降级）
 
     Returns:
         重新排序后的 JudgeResult。
@@ -238,7 +296,8 @@ def rank(
     max_return = int(options.get("max_return", 20))
     threshold = float(options.get("threshold", 0.0))
     weights = dict(options.get("weights") or {})
-    arxiv_only = bool(options.get("arxiv_only", True))
+    arxiv_only = bool(options.get("arxiv_only", False))
+    use_embedding = bool(options.get("use_embedding", True))
 
     # 只重排 filter 已经选中的论文，不复活被丢弃的候选
     selected_ids = {p.paper_id for p in filter_result.selected if p.paper_id}
@@ -250,6 +309,8 @@ def rank(
     query_tokens = _collect_query_tokens(understanding)
     papers = [s.paper for s in pool]
     stats = _compute_stats(papers, query_tokens)
+    if use_embedding:
+        stats["embedding_scores"] = _compute_embedding_scores(understanding, papers)
 
     rescored: List[ScoredPaper] = []
     for s in pool:
